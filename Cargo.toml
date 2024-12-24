@@ -1,0 +1,12 @@
+[package]
+name = "vpn-helper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dotenv = "0.15"
+totp-rs = "5"
+anyhow = "1"
+clap = "4"
+nix = { version = "0.29", features = ["user"] }
+which = "6"
