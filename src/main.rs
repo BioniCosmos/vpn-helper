@@ -1,62 +1,84 @@
 mod config;
+mod constant;
 
 use anyhow::{anyhow, Result};
 use clap::{arg, Command as ClapCommand};
 use config::Config;
-use std::fs::File;
+use constant::{LAUNCHD_PLIST_PATH, MODE_ONCE, MODE_WATCH};
+use std::fs::{self, File};
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 use std::{env, process::Stdio};
 use totp_rs::{Algorithm, Secret, TOTP};
-
-const MODE_WATCH: &str = "watch";
-const MODE_ONCE: &str = "once";
 
 fn main() -> Result<()> {
     let matches = ClapCommand::new("vpn-helper")
         .subcommand(
             ClapCommand::new("connect")
                 .about("Connect to VPN")
-                .arg(arg!(-m --mode [MODE] "The running mode")),
+                .arg(arg!(-m --mode [MODE] "The running mode").default_value(MODE_ONCE))
+                .arg(arg!(-e --env [ENV] "The environment file directory").default_value(".env")),
         )
-        .subcommand(ClapCommand::new("register").about("Register as macOS launchctl service"))
         .subcommand(ClapCommand::new("disconnect").about("Disconnect the VPN"))
+        .subcommand(
+            ClapCommand::new("add-service")
+                .about("Add launchd service")
+                .arg(arg!(-e --env [ENV] "The environment file directory").default_value(".env")),
+        )
+        .subcommand(ClapCommand::new("remove-service").about("Remove launchd service"))
         .get_matches();
+    check_root()?;
     match matches.subcommand() {
         Some(("connect", sub_matches)) => connect_vpn(
-            sub_matches
-                .get_one::<String>("mode")
-                .map(|s| s.as_str())
-                .unwrap_or(MODE_ONCE),
+            sub_matches.get_one::<String>("mode").unwrap(),
+            sub_matches.get_one::<String>("env").unwrap(),
         ),
-        Some(("register", _)) => register_launchctl(),
         Some(("disconnect", _)) => disconnect(),
+        Some(("add-service", sub_matches)) => {
+            add_launchd_service(sub_matches.get_one::<String>("env").unwrap())
+        }
+        Some(("remove-service", _)) => remove_launchd_service(),
         _ => Err(anyhow!(
-            "Invalid command. Use 'connect' or 'register' or 'disconnect'."
+            "Invalid command. Try 'vpn-helper --help' for more information"
         )),
     }
 }
 
-fn connect_vpn(mode: &str) -> Result<()> {
-    check_root()?;
+fn connect_vpn(mode: &str, env: &str) -> Result<()> {
     check_required_programs()?;
-    dotenv::dotenv()?;
+    dotenv::from_path(Path::new(env).canonicalize()?)?;
     let config = Config::from_env()?;
-    let secret = Secret::Encoded(config.totp_secret);
-    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret.to_bytes()?)?;
-    let token = totp.generate_current()?;
+    let token = TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        Secret::Encoded(config.totp_secret).to_bytes()?,
+    )?
+    .generate_current()?;
+    let script = format!("vpn-slice {}", config.route_cidr);
+    let mut options = vec![
+        "--user",
+        &config.username,
+        "--passwd-on-stdin",
+        "--script",
+        &script,
+    ];
+    if mode == MODE_ONCE {
+        options.push("--background");
+    }
     let mut child = Command::new("openconnect")
-        .arg("--user")
-        .arg(&config.username)
-        .arg("--passwd-on-stdin")
-        .arg("--background")
-        .arg("--script")
-        .arg(format!("vpn-slice {}", config.route_cidr))
-        .arg(&config.host)
+        .args(options)
+        .arg(config.host)
         .stdin(Stdio::piped())
         .spawn()?;
-    let mut stdin = child.stdin.take().ok_or(anyhow!("Failed to open stdin"))?;
-    write!(&mut stdin, "{}{}", config.password, token)?;
+    write!(
+        child.stdin.take().ok_or(anyhow!("Failed to open stdin"))?,
+        "{}{}",
+        config.password,
+        token
+    )?;
     println!("OpenConnect is running on {}.", child.id());
     if mode == MODE_WATCH {
         child.wait()?;
@@ -64,14 +86,10 @@ fn connect_vpn(mode: &str) -> Result<()> {
     Ok(())
 }
 
-fn register_launchctl() -> Result<()> {
-    println!("Registering as macOS launchctl service...");
-
-    let current_exe = env::current_exe()?;
-    let current_exe_str = current_exe
-        .to_str()
-        .ok_or_else(|| anyhow!("Invalid path"))?;
-    let plist_content = format!(
+fn add_launchd_service(env: &str) -> Result<()> {
+    let mut file = File::create(LAUNCHD_PLIST_PATH)?;
+    write!(
+        file,
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -79,7 +97,7 @@ fn register_launchctl() -> Result<()> {
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>
-	<string>VPN Helper</string>
+	<string>com.moecm.vpn-helper</string>
 	<key>LimitLoadToSessionType</key>
 	<array>
 		<string>Aqua</string>
@@ -92,34 +110,38 @@ fn register_launchctl() -> Result<()> {
 	<array>
 		<string>{}</string>
 		<string>connect</string>
+		<string>--mode</string>
+		<string>watch</string>
+		<string>--env</string>
+		<string>{}</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
 </dict>
 </plist>"#,
-        current_exe_str
-    );
-
-    let plist_path = "/Library/LaunchDaemons/com.moecm.vpn-helper.plist";
-    let mut file = File::create(plist_path)?;
-    file.write_all(plist_content.as_bytes())?;
-
-    Command::new("sudo")
-        .args(&["chown", "root:wheel", plist_path])
+        env::current_exe()?
+            .to_str()
+            .ok_or(anyhow!("Invalid path"))?,
+        Path::new(env).canonicalize()?.display()
+    )?;
+    Command::new("launchctl")
+        .args(["bootstrap", "system", LAUNCHD_PLIST_PATH])
         .status()?;
-    Command::new("sudo")
-        .args(&["chmod", "644", plist_path])
+    println!("VPN Helper has been added to launchd.");
+    Ok(())
+}
+
+fn remove_launchd_service() -> Result<()> {
+    Command::new("launchctl")
+        .args(["bootout", "system", LAUNCHD_PLIST_PATH])
         .status()?;
-
-    Command::new("sudo")
-        .args(&["launchctl", "load", "-w", plist_path])
-        .status()?;
-
-    println!("VPN Helper has been registered as a launchd service.");
-    println!("The service will start automatically on system boot.");
-    println!("To start the service immediately, run:");
-    println!("sudo launchctl start com.user.vpn-helper");
-
+    fs::remove_file(LAUNCHD_PLIST_PATH)?;
+    println!("VPN Helper has been removed from launchd.");
     Ok(())
 }
 
@@ -136,7 +158,7 @@ fn check_root() -> Result<()> {
 }
 
 fn check_required_programs() -> Result<()> {
-    for program in &["openconnect", "vpn-slice"] {
+    for program in ["openconnect", "vpn-slice"] {
         if which::which(program).is_err() {
             return Err(anyhow!("{program} is not installed or not in PATH"));
         }
